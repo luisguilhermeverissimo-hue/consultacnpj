@@ -535,6 +535,16 @@ if __name__ == "__main__":
     port = os.environ.get("PORT")
     if port:
         # Hospedagem remota (ex. Render): expõe via HTTP em vez de stdio.
-        mcp.run(transport="http", host="0.0.0.0", port=int(port), path="/mcp")
+        from starlette.middleware import Middleware
+        from starlette.middleware.cors import CORSMiddleware
+
+        cors = Middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["mcp-session-id"],
+        )
+        mcp.run(transport="http", host="0.0.0.0", port=int(port), path="/mcp", middleware=[cors])
     else:
         mcp.run()
