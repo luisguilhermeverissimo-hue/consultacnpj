@@ -264,7 +264,12 @@ async def cnpj_consultar(params: ConsultarCnpjInput) -> Dict[str, Any]:
         Se nao encontrado, retorna {"encontrado": False, "cnpj": "..."} — o CNPJ pode
         nao existir, ou existir mas nao ter estabelecimento no Ceara.
     """
-    cnpj = params.cnpj
+    return await _consultar_cnpj_impl(params.cnpj)
+
+
+async def _consultar_cnpj_impl(cnpj: str) -> Dict[str, Any]:
+    """Logica de cnpj_consultar, extraida para ser reaproveitada por
+    cnpj_ficha_completa sem duplicar codigo."""
     rows = await _query(
         """
         SELECT es.*, m.descricao AS municipio_nome, c.descricao AS atividade_principal_descricao
@@ -884,27 +889,46 @@ async def cnpj_estatisticas(params: EstatisticasInput) -> Dict[str, Any]:
         lista de {"codigo", "descricao", "codigo_2"?, "descricao_2"?, "quantidade"},
         ordenada por quantidade decrescente.
     """
-    p = params
-    group_col, desc_col, join_clause = GROUP_BY_COLUMNS[p.agrupar_por]
+    return await _estatisticas_impl(
+        agrupar_por=params.agrupar_por,
+        agrupar_por_2=params.agrupar_por_2,
+        municipio_codigo=params.municipio_codigo,
+        cnae_codigo=params.cnae_codigo,
+        situacao_cadastral=params.situacao_cadastral,
+        top=params.top,
+    )
+
+
+async def _estatisticas_impl(
+    agrupar_por: str,
+    agrupar_por_2: Optional[str] = None,
+    municipio_codigo: Optional[str] = None,
+    cnae_codigo: Optional[str] = None,
+    situacao_cadastral: Optional[str] = None,
+    top: int = 15,
+) -> Dict[str, Any]:
+    """Logica de cnpj_estatisticas, extraida para ser reaproveitada por
+    cnpj_panorama_setorial sem duplicar codigo."""
+    group_col, desc_col, join_clause = GROUP_BY_COLUMNS[agrupar_por]
     group_col2 = desc_col2 = join_clause2 = None
-    if p.agrupar_por_2:
-        group_col2, desc_col2, join_clause2 = GROUP_BY_COLUMNS[p.agrupar_por_2]
+    if agrupar_por_2:
+        group_col2, desc_col2, join_clause2 = GROUP_BY_COLUMNS[agrupar_por_2]
 
     where = []
     args: list = []
-    if p.municipio_codigo:
+    if municipio_codigo:
         where.append("es.municipio = ?")
-        args.append(p.municipio_codigo)
-    if p.cnae_codigo:
+        args.append(municipio_codigo)
+    if cnae_codigo:
         where.append("es.cnae_fiscal_principal = ?")
-        args.append(p.cnae_codigo)
-    if p.situacao_cadastral:
+        args.append(cnae_codigo)
+    if situacao_cadastral:
         where.append("es.situacao_cadastral = ?")
-        args.append(p.situacao_cadastral)
+        args.append(situacao_cadastral)
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
 
     join_sql = ""
-    if "natureza_juridica" in (p.agrupar_por, p.agrupar_por_2):
+    if "natureza_juridica" in (agrupar_por, agrupar_por_2):
         join_sql = "JOIN empresas em ON em.cnpj_basico = es.cnpj_basico"
 
     select_desc = "NULL AS descricao"
@@ -931,18 +955,18 @@ async def cnpj_estatisticas(params: EstatisticasInput) -> Dict[str, Any]:
         ORDER BY quantidade DESC
         LIMIT ?
     """
-    args.append(p.top)
+    args.append(top)
     rows = await _query(sql, tuple(args))
-    if p.agrupar_por == "situacao_cadastral":
+    if agrupar_por == "situacao_cadastral":
         for r in rows:
             r["descricao"] = _situacao_label(r.get("codigo"))
-    if p.agrupar_por_2 == "situacao_cadastral":
+    if agrupar_por_2 == "situacao_cadastral":
         for r in rows:
             r["descricao_2"] = _situacao_label(r.get("codigo_2"))
 
-    result = {"agrupado_por": p.agrupar_por, "resultados": rows}
-    if p.agrupar_por_2:
-        result["agrupado_por_2"] = p.agrupar_por_2
+    result = {"agrupado_por": agrupar_por, "resultados": rows}
+    if agrupar_por_2:
+        result["agrupado_por_2"] = agrupar_por_2
     return result
 
 
@@ -1030,6 +1054,182 @@ async def cnpj_exportar_csv(params: ExportarCsvInput) -> Dict[str, Any]:
         "linhas_exportadas": len(rows),
         "csv": buf.getvalue(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Tool 7: ficha completa (consulta + contexto setorial numa chamada so)
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="cnpj_ficha_completa",
+    annotations={
+        "title": "Ficha completa de um CNPJ (com contexto setorial)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def cnpj_ficha_completa(params: ConsultarCnpjInput) -> Dict[str, Any]:
+    """Ficha completa de um CNPJ: tudo que cnpj_consultar traz (empresa,
+    estabelecimento, socios, Simples/MEI) MAIS contexto setorial automatico
+    (quantas empresas ativas/baixadas/inaptas/etc no mesmo CNAE principal e
+    municipio). Use esta ferramenta sempre que o pedido for por "ficha completa",
+    "perfil completo" ou "raio-x" de uma empresa — ja inclui a analise que
+    normalmente precisaria de uma chamada em cnpj_consultar mais outra em
+    cnpj_estatisticas.
+
+    Args:
+        params (ConsultarCnpjInput): contem o campo 'cnpj' com o numero completo (14 digitos).
+
+    Returns:
+        Mesmas chaves de cnpj_consultar (encontrado, estabelecimento, empresa,
+        socios, simples) mais 'contexto_setorial' (dict | None): descricao,
+        contagem por situacao cadastral, total e ativas no mesmo CNAE+municipio.
+        contexto_setorial vem None se a empresa nao tiver CNAE ou municipio
+        registrado (raro).
+    """
+    base = await _consultar_cnpj_impl(params.cnpj)
+    if not base.get("encontrado"):
+        return base
+
+    estab = base["estabelecimento"]
+    cnae = estab.get("cnae_fiscal_principal")
+    municipio = estab.get("municipio")
+
+    contexto = None
+    if cnae and municipio:
+        stats = await _estatisticas_impl("situacao_cadastral", municipio_codigo=municipio, cnae_codigo=cnae, top=10)
+        resultados = stats["resultados"]
+        total_setor = sum(r["quantidade"] for r in resultados)
+        ativas = next((r["quantidade"] for r in resultados if r["codigo"] == "02"), 0)
+        contexto = {
+            "descricao": (
+                f"Estabelecimentos com o mesmo CNAE principal ({cnae}) no municipio "
+                f"{estab.get('municipio_nome') or municipio}"
+            ),
+            "por_situacao_cadastral": resultados,
+            "total_no_setor_local": total_setor,
+            "ativas_no_setor_local": ativas,
+        }
+
+    base["contexto_setorial"] = contexto
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Tool 8: panorama setorial/regional
+# ---------------------------------------------------------------------------
+
+class PanoramaSetorialInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    cnae_codigo: Optional[str] = Field(
+        default=None, description="Codigo do CNAE para analisar (obtenha com cnpj_referencia_buscar tabela='cnae')."
+    )
+    municipio_codigo: Optional[str] = Field(
+        default=None, description="Codigo do municipio para analisar (obtenha com cnpj_referencia_buscar tabela='municipio')."
+    )
+    top: int = Field(default=10, description="Quantas categorias retornar em cada ranking (1-50).", ge=1, le=50)
+
+    @model_validator(mode="after")
+    def _pelo_menos_um(self):
+        if not self.cnae_codigo and not self.municipio_codigo:
+            raise ValueError("Informe pelo menos cnae_codigo ou municipio_codigo.")
+        return self
+
+
+@mcp.tool(
+    name="cnpj_panorama_setorial",
+    annotations={
+        "title": "Panorama setorial ou regional",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def cnpj_panorama_setorial(params: PanoramaSetorialInput) -> Dict[str, Any]:
+    """Panorama completo de um setor (CNAE) e/ou regiao (municipio) do Ceara:
+    situacao cadastral, naturezas juridicas mais comuns entre as ativas, e um
+    ranking (top municipios se so cnae_codigo for informado, ou top atividades
+    se so municipio_codigo for informado). Use esta ferramenta sempre que o
+    pedido for por "panorama setorial", "visao geral do mercado/setor", "como
+    esta o setor X" ou "raio-x de uma regiao" — ja combina varias chamadas de
+    cnpj_estatisticas numa resposta so. Pode levar alguns segundos a mais que
+    uma chamada unica de cnpj_estatisticas, por fazer 3-4 consultas internas.
+
+    Args:
+        params (PanoramaSetorialInput): cnae_codigo e/ou municipio_codigo
+            (pelo menos um obrigatorio), mais 'top' para os rankings.
+
+    Returns:
+        dict com 'filtros' (o que foi analisado), 'por_situacao_cadastral',
+        'por_natureza_juridica_ativas', e 'top_municipios_ativas' (so quando
+        so cnae_codigo foi informado) ou 'top_atividades_ativas' (so quando so
+        municipio_codigo foi informado).
+    """
+    p = params
+    situacao = await _estatisticas_impl(
+        "situacao_cadastral", municipio_codigo=p.municipio_codigo, cnae_codigo=p.cnae_codigo, top=10
+    )
+    natureza = await _estatisticas_impl(
+        "natureza_juridica", municipio_codigo=p.municipio_codigo, cnae_codigo=p.cnae_codigo,
+        situacao_cadastral="02", top=p.top,
+    )
+
+    result: Dict[str, Any] = {
+        "filtros": {"cnae_codigo": p.cnae_codigo, "municipio_codigo": p.municipio_codigo},
+        "por_situacao_cadastral": situacao["resultados"],
+        "por_natureza_juridica_ativas": natureza["resultados"],
+    }
+
+    if p.cnae_codigo and not p.municipio_codigo:
+        top_mun = await _estatisticas_impl("municipio", cnae_codigo=p.cnae_codigo, situacao_cadastral="02", top=p.top)
+        result["top_municipios_ativas"] = top_mun["resultados"]
+    if p.municipio_codigo and not p.cnae_codigo:
+        top_cnae = await _estatisticas_impl("cnae", municipio_codigo=p.municipio_codigo, situacao_cadastral="02", top=p.top)
+        result["top_atividades_ativas"] = top_cnae["resultados"]
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Prompts: atalhos para pedidos comuns em texto livre ("ficha completa",
+# "panorama setorial") aparecerem como acao rapida na interface do cliente MCP
+# (quando o cliente suportar prompts — nem todos exibem essa lista).
+# ---------------------------------------------------------------------------
+
+@mcp.prompt(
+    name="ficha_completa",
+    description="Ficha completa de uma empresa do Ceara (dados cadastrais + contexto setorial) a partir do CNPJ.",
+)
+def ficha_completa_prompt(cnpj: str) -> str:
+    return (
+        f"Use a ferramenta cnpj_ficha_completa para consultar o CNPJ {cnpj}. "
+        "Apresente o resultado formatado de forma clara (nao como JSON cru): dados da "
+        "empresa, do estabelecimento, socios, Simples/MEI, e o contexto setorial "
+        "(quantas empresas ativas/baixadas existem no mesmo ramo e municipio)."
+    )
+
+
+@mcp.prompt(
+    name="panorama_setorial",
+    description="Panorama de um setor (CNAE) e/ou regiao (municipio) do Ceara: situacao cadastral, naturezas juridicas e rankings.",
+)
+def panorama_setorial_prompt(cnae_codigo: str = "", municipio_codigo: str = "") -> str:
+    filtros = []
+    if cnae_codigo:
+        filtros.append(f"cnae_codigo='{cnae_codigo}'")
+    if municipio_codigo:
+        filtros.append(f"municipio_codigo='{municipio_codigo}'")
+    filtros_txt = ", ".join(filtros) if filtros else "(pergunte ao usuario qual CNAE ou municipio analisar)"
+    return (
+        f"Use a ferramenta cnpj_panorama_setorial com {filtros_txt}. Se precisar descobrir "
+        "o codigo do CNAE ou municipio a partir de um nome, use cnpj_referencia_buscar antes. "
+        "Apresente o resultado formatado de forma clara (nao como JSON cru), com uma leitura "
+        "interpretativa dos numeros, nao so a tabela."
+    )
 
 
 # ---------------------------------------------------------------------------
