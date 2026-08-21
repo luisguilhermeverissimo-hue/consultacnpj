@@ -20,7 +20,7 @@ import os
 import sqlite3
 from typing import Optional, List, Dict, Any
 
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 from fastmcp import FastMCP
 
 mcp = FastMCP("cnpj_ce_mcp")
@@ -39,11 +39,36 @@ SITUACAO_CADASTRAL_MAP = {
     "08": "BAIXADA",
 }
 
+MATRIZ_FILIAL_MAP = {"1": "MATRIZ", "2": "FILIAL"}
+
+IDENTIFICADOR_SOCIO_MAP = {"1": "PESSOA JURIDICA", "2": "PESSOA FISICA", "3": "ESTRANGEIRO"}
+
+FAIXA_ETARIA_MAP = {
+    "0": "NAO SE APLICA",
+    "1": "0 A 12 ANOS",
+    "2": "13 A 20 ANOS",
+    "3": "21 A 30 ANOS",
+    "4": "31 A 40 ANOS",
+    "5": "41 A 50 ANOS",
+    "6": "51 A 60 ANOS",
+    "7": "61 A 70 ANOS",
+    "8": "71 A 80 ANOS",
+    "9": "MAIOR QUE 80 ANOS",
+}
+
 GROUP_BY_COLUMNS = {
     "municipio": ("es.municipio", "m.descricao", "municipio m ON m.codigo = es.municipio"),
     "cnae": ("es.cnae_fiscal_principal", "c.descricao", "cnae c ON c.codigo = es.cnae_fiscal_principal"),
     "natureza_juridica": ("em.natureza_juridica", "nj.descricao", "natureza_juridica nj ON nj.codigo = em.natureza_juridica"),
     "situacao_cadastral": ("es.situacao_cadastral", None, None),
+}
+
+ORDENAR_POR_SQL = {
+    "razao_social": "em.razao_social ASC",
+    "capital_social_desc": "em.capital_social DESC",
+    "capital_social_asc": "em.capital_social ASC",
+    "data_inicio_desc": "es.data_inicio_atividade DESC",
+    "data_inicio_asc": "es.data_inicio_atividade ASC",
 }
 
 REFERENCE_TABLES = {
@@ -106,6 +131,21 @@ def _only_digits(s: str) -> str:
     return "".join(ch for ch in s if ch.isdigit())
 
 
+def _fts_match_query(text: str) -> Optional[str]:
+    """Monta uma query FTS5 a partir de texto livre: AND implicito entre palavras,
+    prefixo por palavra (ex: 'vo leonor' -> '"vo"* "leonor"*', acha qualquer linha
+    com um token comecando por 'vo' E outro comecando por 'leonor', em qualquer
+    ordem). Cada palavra vai entre aspas para blindar contra sintaxe especial do
+    FTS5 (: ^ - etc.). Retorna None se nao sobrar nenhum termo valido (ex: texto
+    so com pontuacao)."""
+    parts = []
+    for token in text.split():
+        cleaned = token.replace('"', "")
+        if cleaned:
+            parts.append(f'"{cleaned}"*')
+    return " ".join(parts) if parts else None
+
+
 def _situacao_label(code: Optional[str]) -> Optional[str]:
     if code is None:
         return None
@@ -141,6 +181,21 @@ def _norm_sql_expr(column_sql: str) -> str:
     for accented, base in _ACCENT_PAIRS:
         expr = f"REPLACE({expr}, '{accented}', '{base}')"
     return expr
+
+
+def _split_codes(v: Optional[str]) -> List[str]:
+    """Separa uma lista de codigos por virgula (ex: '1389,1373') em uma lista limpa."""
+    if not v:
+        return []
+    return [c.strip() for c in v.split(",") if c.strip()]
+
+
+def _in_clause(column_sql: str, codes: List[str]) -> tuple:
+    """Monta 'column IN (?,?,...)' (ou 'column = ?' para um unico codigo) e os args."""
+    if len(codes) == 1:
+        return f"{column_sql} = ?", tuple(codes)
+    placeholders = ",".join("?" for _ in codes)
+    return f"{column_sql} IN ({placeholders})", tuple(codes)
 
 
 def _yyyymmdd(v: Optional[str]) -> Optional[str]:
@@ -256,155 +311,75 @@ async def cnpj_consultar(params: ConsultarCnpjInput) -> Dict[str, Any]:
 # Tool 2: busca de estabelecimentos (nome, atividade, municipio, situacao)
 # ---------------------------------------------------------------------------
 
-class BuscarEstabelecimentosInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    razao_social: Optional[str] = Field(
-        default=None, description="Trecho da razao social a buscar (busca parcial, sem diferenciar maiusculas/acentos). Ex: 'PADARIA'.", max_length=200
-    )
-    nome_fantasia: Optional[str] = Field(
-        default=None, description="Trecho do nome fantasia a buscar (busca parcial, sem diferenciar maiusculas/acentos). Ex: 'VO LEONOR'.", max_length=200
-    )
-    municipio_codigo: Optional[str] = Field(
-        default=None, description="Codigo numerico do municipio (obtenha com cnpj_referencia_buscar tabela='municipio').", max_length=10
-    )
-    bairro: Optional[str] = Field(
-        default=None, description="Trecho do bairro a buscar (busca parcial, sem diferenciar maiusculas/acentos). Ex: 'ALDEOTA'.", max_length=200
-    )
-    cnae_codigo: Optional[str] = Field(
-        default=None, description="Codigo do CNAE fiscal principal (obtenha com cnpj_referencia_buscar tabela='cnae').", max_length=10
-    )
-    cnae_secundario_codigo: Optional[str] = Field(
-        default=None,
-        description="Codigo de CNAE que deve aparecer entre as atividades SECUNDARIAS do estabelecimento (nao o principal).",
-        max_length=10,
-    )
-    situacao_cadastral: Optional[str] = Field(
-        default=None, description="Filtra pela situacao cadastral: '01' NULA, '02' ATIVA, '03' SUSPENSA, '04' INAPTA, '08' BAIXADA."
-    )
-    porte_empresa: Optional[str] = Field(
-        default=None, description="Filtra pelo porte da empresa: '01' MICRO EMPRESA, '03' EMPRESA DE PEQUENO PORTE, '05' DEMAIS (nao ME/EPP)."
-    )
-    capital_social_min: Optional[float] = Field(default=None, description="Capital social minimo da empresa (R$), inclusive.", ge=0)
-    capital_social_max: Optional[float] = Field(default=None, description="Capital social maximo da empresa (R$), inclusive.", ge=0)
-    data_inicio_de: Optional[str] = Field(
-        default=None, description="Data de inicio de atividade minima, inclusive (formato 'YYYY-MM-DD' ou 'YYYYMMDD')."
-    )
-    data_inicio_ate: Optional[str] = Field(
-        default=None, description="Data de inicio de atividade maxima, inclusive (formato 'YYYY-MM-DD' ou 'YYYYMMDD')."
-    )
-    opcao_simples: Optional[bool] = Field(
-        default=None, description="Se True, retorna so quem optou pelo Simples Nacional; se False, so quem NAO optou."
-    )
-    opcao_mei: Optional[bool] = Field(
-        default=None, description="Se True, retorna so MEIs; se False, so quem NAO e MEI."
-    )
-    tem_situacao_especial: Optional[bool] = Field(
-        default=None,
-        description="Se True, retorna so estabelecimentos com situacao especial registrada (falencia, recuperacao "
-        "judicial, liquidacao, espolio etc.); se False, so quem NAO tem nenhuma.",
-    )
-    limit: int = Field(default=20, description="Numero maximo de resultados (1-100).", ge=1, le=100)
-    offset: int = Field(default=0, description="Quantos resultados pular, para paginacao.", ge=0)
-
-    @field_validator("razao_social", "nome_fantasia", "bairro")
-    @classmethod
-    def _non_empty(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and not v.strip():
-            return None
-        return v
-
-    @field_validator("data_inicio_de", "data_inicio_ate")
-    @classmethod
-    def _valida_data(cls, v: Optional[str]) -> Optional[str]:
-        return _yyyymmdd(v)
+_FROM_ESTABELECIMENTOS = """
+    FROM estabelecimentos es
+    JOIN empresas em ON em.cnpj_basico = es.cnpj_basico
+    LEFT JOIN simples si ON si.cnpj_basico = es.cnpj_basico
+    LEFT JOIN municipio m ON m.codigo = es.municipio
+    LEFT JOIN cnae c ON c.codigo = es.cnae_fiscal_principal
+    LEFT JOIN motivo mo ON mo.codigo = es.motivo_situacao_cadastral
+"""
 
 
-@mcp.tool(
-    name="cnpj_buscar_estabelecimentos",
-    annotations={
-        "title": "Buscar estabelecimentos por nome/atividade/municipio",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-async def cnpj_buscar_estabelecimentos(params: BuscarEstabelecimentosInput) -> Dict[str, Any]:
-    """Busca estabelecimentos do Ceara por razao social, nome fantasia, municipio,
-    atividade economica (CNAE) e/ou situacao cadastral. Pelo menos um filtro de
-    texto (razao_social ou nome_fantasia) ou codigo (municipio_codigo/cnae_codigo)
-    deve ser informado — caso contrario a lista seria enorme. Util para prospeccao
-    (ex: 'padarias ativas em Fortaleza') e para localizar o CNPJ de uma empresa
-    quando so se sabe o nome.
-
-    A busca por texto (razao_social, nome_fantasia, bairro) ignora maiusculas/
-    minusculas mas NAO ignora acentos (ex: 'sao paulo' NAO encontra 'São Paulo';
-    use o texto acentuado como esta na base). Use cnpj_referencia_buscar (que
-    ignora acentos) para confirmar o codigo de um municipio antes, se tiver duvida.
-
-    Args:
-        params (BuscarEstabelecimentosInput): filtros de busca (todos opcionais,
-            exceto que pelo menos um deve ser preenchido), mais limit/offset para paginacao.
-
-    Returns:
-        dict com as chaves:
-            - total_encontrado (int | None): total de resultados que atendem aos
-              filtros (pode ser maior que a pagina atual — use offset/limit para
-              paginar). Vem None quando a busca usa razao_social/nome_fantasia/
-              bairro (texto livre sem indice) — nesse caso 'total_encontrado_obs'
-              explica o motivo; combine com um filtro indexado (municipio_codigo,
-              cnae_codigo etc.) se precisar do total exato.
-            - total_retornado (int): quantidade de linhas nesta pagina
-            - offset (int)
-            - limit (int)
-            - resultados (list[dict]): cada item contem cnpj, razao_social, nome_fantasia,
-              municipio_nome, atividade_principal_descricao, situacao_cadastral_descricao,
-              logradouro/numero/bairro/cep, telefone1, correio_eletronico, porte_empresa,
-              capital_social, data_inicio_atividade, opcao_simples, opcao_mei
-        Retorna erro se nenhum filtro for informado.
-    """
-    p = params
-    if not any([
-        p.razao_social, p.nome_fantasia, p.municipio_codigo, p.bairro, p.cnae_codigo,
-        p.cnae_secundario_codigo, p.situacao_cadastral, p.porte_empresa,
-        p.capital_social_min is not None, p.capital_social_max is not None,
-        p.data_inicio_de, p.data_inicio_ate,
-        p.opcao_simples is not None, p.opcao_mei is not None, p.tem_situacao_especial is not None,
-    ]):
-        return {
-            "erro": "Informe pelo menos um filtro (ex: razao_social, nome_fantasia, municipio_codigo, "
-            "cnae_codigo, porte_empresa, capital_social_min/max, data_inicio_de/ate, opcao_simples, opcao_mei)."
-        }
-
+def _montar_where_estabelecimentos(p) -> tuple:
+    """Monta a clausula WHERE, os args e JOINs extras (FTS5) para os filtros de
+    estabelecimentos, compartilhada entre cnpj_buscar_estabelecimentos e
+    cnpj_exportar_csv. Retorna (where_sql, args, extra_join_sql)."""
     where = []
     args: list = []
-    # Nota: razao_social/nome_fantasia/bairro usam LIKE simples (nao a busca
-    # insensivel a acento de _norm_sql_expr) de proposito — nessas tabelas
-    # grandes (~2M linhas) o REPLACE em cascata para remover acentos custava
-    # ~28s por busca (sem indice utilizavel). Ficou reservado para tabelas
-    # pequenas (referencia) e nome_socio, onde o custo e desprezivel.
+    extra_join: list = []
+    # razao_social/nome_fantasia/bairro usam indices FTS5 (fts_empresas,
+    # fts_estab_fantasia, fts_estab_bairro; ver mcp/SETUP_TURSO_MCP.md) em vez de
+    # LIKE '%...%' — sem eles, essas buscas em tabelas de ~2M linhas levavam
+    # 12-28s por nao terem indice utilizavel. tokenize="unicode61 remove_diacritics 2"
+    # tambem os torna insensiveis a acento.
     if p.razao_social:
-        where.append("em.razao_social LIKE ? COLLATE NOCASE")
-        args.append(f"%{p.razao_social}%")
+        fts_q = _fts_match_query(p.razao_social)
+        if fts_q:
+            extra_join.append("JOIN fts_empresas fts_rs ON fts_rs.rowid = em.rowid")
+            where.append("fts_rs.razao_social MATCH ?")
+            args.append(fts_q)
+        else:
+            where.append("0")
     if p.nome_fantasia:
-        where.append("es.nome_fantasia LIKE ? COLLATE NOCASE")
-        args.append(f"%{p.nome_fantasia}%")
+        fts_q = _fts_match_query(p.nome_fantasia)
+        if fts_q:
+            extra_join.append("JOIN fts_estab_fantasia fts_nf ON fts_nf.rowid = es.rowid")
+            where.append("fts_nf.nome_fantasia MATCH ?")
+            args.append(fts_q)
+        else:
+            where.append("0")
     if p.bairro:
-        where.append("es.bairro LIKE ? COLLATE NOCASE")
-        args.append(f"%{p.bairro}%")
+        fts_q = _fts_match_query(p.bairro)
+        if fts_q:
+            extra_join.append("JOIN fts_estab_bairro fts_bi ON fts_bi.rowid = es.rowid")
+            where.append("fts_bi.bairro MATCH ?")
+            args.append(fts_q)
+        else:
+            where.append("0")
+    if p.cep_prefixo:
+        where.append("es.cep LIKE ?")
+        args.append(f"{_only_digits(p.cep_prefixo)}%")
     if p.municipio_codigo:
-        where.append("es.municipio = ?")
-        args.append(p.municipio_codigo)
+        clause, vals = _in_clause("es.municipio", _split_codes(p.municipio_codigo))
+        where.append(clause)
+        args.extend(vals)
     if p.cnae_codigo:
-        where.append("es.cnae_fiscal_principal = ?")
-        args.append(p.cnae_codigo)
+        clause, vals = _in_clause("es.cnae_fiscal_principal", _split_codes(p.cnae_codigo))
+        where.append(clause)
+        args.extend(vals)
     if p.cnae_secundario_codigo:
         where.append("(',' || es.cnae_fiscal_secundaria || ',') LIKE ?")
         args.append(f"%,{p.cnae_secundario_codigo},%")
     if p.situacao_cadastral:
         where.append("es.situacao_cadastral = ?")
         args.append(p.situacao_cadastral)
+    if p.motivo_situacao_cadastral:
+        where.append("es.motivo_situacao_cadastral = ?")
+        args.append(p.motivo_situacao_cadastral)
+    if p.apenas_matriz is not None:
+        where.append("es.identificador_matriz_filial = ?")
+        args.append("1" if p.apenas_matriz else "2")
     if p.porte_empresa:
         where.append("em.porte_empresa = ?")
         args.append(p.porte_empresa)
@@ -420,6 +395,12 @@ async def cnpj_buscar_estabelecimentos(params: BuscarEstabelecimentosInput) -> D
     if p.data_inicio_ate:
         where.append("es.data_inicio_atividade <= ?")
         args.append(p.data_inicio_ate)
+    if p.data_situacao_de:
+        where.append("es.data_situacao_cadastral >= ?")
+        args.append(p.data_situacao_de)
+    if p.data_situacao_ate:
+        where.append("es.data_situacao_cadastral <= ?")
+        args.append(p.data_situacao_ate)
     if p.opcao_simples is not None:
         where.append("si.opcao_simples = ?")
         args.append("S" if p.opcao_simples else "N")
@@ -431,52 +412,220 @@ async def cnpj_buscar_estabelecimentos(params: BuscarEstabelecimentosInput) -> D
             where.append("(es.situacao_especial IS NOT NULL AND es.situacao_especial <> '')")
         else:
             where.append("(es.situacao_especial IS NULL OR es.situacao_especial = '')")
+    if p.tem_telefone is not None:
+        if p.tem_telefone:
+            where.append("(es.telefone1 IS NOT NULL AND es.telefone1 <> '')")
+        else:
+            where.append("(es.telefone1 IS NULL OR es.telefone1 = '')")
+    if p.tem_email is not None:
+        if p.tem_email:
+            where.append("(es.correio_eletronico IS NOT NULL AND es.correio_eletronico <> '')")
+        else:
+            where.append("(es.correio_eletronico IS NULL OR es.correio_eletronico = '')")
+    return " AND ".join(where), args, " ".join(extra_join)
 
-    where_sql = " AND ".join(where)
-    from_sql = """
-        FROM estabelecimentos es
-        JOIN empresas em ON em.cnpj_basico = es.cnpj_basico
-        LEFT JOIN simples si ON si.cnpj_basico = es.cnpj_basico
-        LEFT JOIN municipio m ON m.codigo = es.municipio
-        LEFT JOIN cnae c ON c.codigo = es.cnae_fiscal_principal
+
+def _tem_algum_filtro_estabelecimentos(p) -> bool:
+    return any([
+        p.razao_social, p.nome_fantasia, p.municipio_codigo, p.bairro, p.cep_prefixo, p.cnae_codigo,
+        p.cnae_secundario_codigo, p.situacao_cadastral, p.motivo_situacao_cadastral,
+        p.apenas_matriz is not None, p.porte_empresa,
+        p.capital_social_min is not None, p.capital_social_max is not None,
+        p.data_inicio_de, p.data_inicio_ate, p.data_situacao_de, p.data_situacao_ate,
+        p.opcao_simples is not None, p.opcao_mei is not None, p.tem_situacao_especial is not None,
+        p.tem_telefone is not None, p.tem_email is not None,
+    ])
+
+
+class BuscarEstabelecimentosInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    razao_social: Optional[str] = Field(
+        default=None, description="Trecho da razao social a buscar (uma ou mais palavras; ignora acentos e maiusculas/minusculas). Ex: 'PADARIA'.", max_length=200
+    )
+    nome_fantasia: Optional[str] = Field(
+        default=None, description="Trecho do nome fantasia a buscar (uma ou mais palavras; ignora acentos e maiusculas/minusculas). Ex: 'VO LEONOR'.", max_length=200
+    )
+    municipio_codigo: Optional[str] = Field(
+        default=None,
+        description="Codigo(s) numerico(s) do municipio, separados por virgula para buscar em varios de uma vez "
+        "(ex: '1389,1373'). Obtenha com cnpj_referencia_buscar tabela='municipio'.",
+        max_length=200,
+    )
+    bairro: Optional[str] = Field(
+        default=None, description="Trecho do bairro a buscar (uma ou mais palavras; ignora acentos e maiusculas/minusculas). Ex: 'ALDEOTA'.", max_length=200
+    )
+    cep_prefixo: Optional[str] = Field(
+        default=None, description="Prefixo do CEP para busca hiperlocal (ex: '60712' encontra todos os CEPs que comecam assim).", max_length=8
+    )
+    cnae_codigo: Optional[str] = Field(
+        default=None,
+        description="Codigo(s) de CNAE fiscal principal, separados por virgula para buscar em varios de uma vez "
+        "(ex: '4781400,4712100'). Obtenha com cnpj_referencia_buscar tabela='cnae'.",
+        max_length=200,
+    )
+    cnae_secundario_codigo: Optional[str] = Field(
+        default=None,
+        description="Codigo de CNAE que deve aparecer entre as atividades SECUNDARIAS do estabelecimento (nao o principal).",
+        max_length=10,
+    )
+    situacao_cadastral: Optional[str] = Field(
+        default=None, description="Filtra pela situacao cadastral: '01' NULA, '02' ATIVA, '03' SUSPENSA, '04' INAPTA, '08' BAIXADA."
+    )
+    motivo_situacao_cadastral: Optional[str] = Field(
+        default=None,
+        description="Codigo do motivo da situacao cadastral (ex: motivo da baixa — incorporacao, omissao de "
+        "declaracoes etc.). Obtenha com cnpj_referencia_buscar tabela='motivo'.",
+        max_length=10,
+    )
+    apenas_matriz: Optional[bool] = Field(
+        default=None, description="Se True, retorna so matrizes (exclui filiais); se False, retorna so filiais."
+    )
+    porte_empresa: Optional[str] = Field(
+        default=None, description="Filtra pelo porte da empresa: '01' MICRO EMPRESA, '03' EMPRESA DE PEQUENO PORTE, '05' DEMAIS (nao ME/EPP)."
+    )
+    capital_social_min: Optional[float] = Field(default=None, description="Capital social minimo da empresa (R$), inclusive.", ge=0)
+    capital_social_max: Optional[float] = Field(default=None, description="Capital social maximo da empresa (R$), inclusive.", ge=0)
+    data_inicio_de: Optional[str] = Field(
+        default=None, description="Data de inicio de atividade minima, inclusive (formato 'YYYY-MM-DD' ou 'YYYYMMDD')."
+    )
+    data_inicio_ate: Optional[str] = Field(
+        default=None, description="Data de inicio de atividade maxima, inclusive (formato 'YYYY-MM-DD' ou 'YYYYMMDD')."
+    )
+    data_situacao_de: Optional[str] = Field(
+        default=None,
+        description="Data minima da ULTIMA mudanca de situacao cadastral, inclusive (formato 'YYYY-MM-DD' ou "
+        "'YYYYMMDD'). Util para achar quem foi baixado/mudou de status num periodo (ex: analise de churn).",
+    )
+    data_situacao_ate: Optional[str] = Field(
+        default=None, description="Data maxima da ULTIMA mudanca de situacao cadastral, inclusive (mesmo formato de data_situacao_de)."
+    )
+    opcao_simples: Optional[bool] = Field(
+        default=None, description="Se True, retorna so quem optou pelo Simples Nacional; se False, so quem NAO optou."
+    )
+    opcao_mei: Optional[bool] = Field(
+        default=None, description="Se True, retorna so MEIs; se False, so quem NAO e MEI."
+    )
+    tem_situacao_especial: Optional[bool] = Field(
+        default=None,
+        description="Se True, retorna so estabelecimentos com situacao especial registrada (falencia, recuperacao "
+        "judicial, liquidacao, espolio etc.); se False, so quem NAO tem nenhuma.",
+    )
+    tem_telefone: Optional[bool] = Field(
+        default=None, description="Se True, retorna so quem tem telefone cadastrado; se False, so quem NAO tem (qualidade de dado/prospeccao)."
+    )
+    tem_email: Optional[bool] = Field(
+        default=None, description="Se True, retorna so quem tem e-mail cadastrado; se False, so quem NAO tem (qualidade de dado/prospeccao)."
+    )
+    ordenar_por: str = Field(
+        default="razao_social",
+        description="Como ordenar os resultados: 'razao_social' (A-Z, padrao), 'capital_social_desc' "
+        "(maior capital primeiro), 'capital_social_asc', 'data_inicio_desc' (mais recentes primeiro), "
+        "'data_inicio_asc' (mais antigas primeiro).",
+    )
+    limit: int = Field(default=20, description="Numero maximo de resultados (1-100).", ge=1, le=100)
+    offset: int = Field(default=0, description="Quantos resultados pular, para paginacao.", ge=0)
+
+    @field_validator("razao_social", "nome_fantasia", "bairro")
+    @classmethod
+    def _non_empty(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not v.strip():
+            return None
+        return v
+
+    @field_validator("data_inicio_de", "data_inicio_ate", "data_situacao_de", "data_situacao_ate")
+    @classmethod
+    def _valida_data(cls, v: Optional[str]) -> Optional[str]:
+        return _yyyymmdd(v)
+
+    @field_validator("ordenar_por")
+    @classmethod
+    def _valida_ordenacao(cls, v: str) -> str:
+        if v not in ORDENAR_POR_SQL:
+            raise ValueError(f"ordenar_por deve ser uma de: {', '.join(ORDENAR_POR_SQL)}")
+        return v
+
+
+@mcp.tool(
+    name="cnpj_buscar_estabelecimentos",
+    annotations={
+        "title": "Buscar estabelecimentos por nome/atividade/municipio",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def cnpj_buscar_estabelecimentos(params: BuscarEstabelecimentosInput) -> Dict[str, Any]:
+    """Busca estabelecimentos do Ceara por razao social, nome fantasia, municipio,
+    atividade economica (CNAE) e mais de uma dezena de outros filtros (porte,
+    capital social, datas, bairro, CEP, Simples/MEI, matriz/filial, situacao
+    especial, telefone/e-mail cadastrado etc.). Pelo menos um filtro deve ser
+    informado — caso contrario a lista seria enorme. Util para prospeccao (ex:
+    'padarias ativas em Fortaleza') e para localizar o CNPJ de uma empresa quando
+    so se sabe o nome.
+
+    A busca por texto (razao_social, nome_fantasia, bairro) usa indice de busca
+    completa (FTS5): ignora acentos e maiusculas/minusculas, aceita varias
+    palavras (todas precisam aparecer, em qualquer ordem — ex: 'padaria centro'
+    acha 'PADARIA E CONFEITARIA DO CENTRO') e cada palavra e tratada como prefixo
+    (ex: 'panif' acha 'PANIFICADORA').
+
+    Args:
+        params (BuscarEstabelecimentosInput): filtros de busca (todos opcionais,
+            exceto que pelo menos um deve ser preenchido), 'ordenar_por' para
+            escolher a ordenacao, mais limit/offset para paginacao.
+
+    Returns:
+        dict com as chaves:
+            - total_encontrado (int): total de resultados que atendem aos filtros
+              (pode ser maior que a pagina atual — use offset/limit para paginar)
+            - total_retornado (int): quantidade de linhas nesta pagina
+            - offset (int)
+            - limit (int)
+            - resultados (list[dict]): cada item contem cnpj, razao_social, nome_fantasia,
+              municipio_nome, atividade_principal_descricao, situacao_cadastral_descricao,
+              motivo_situacao_descricao, matriz_filial_descricao,
+              logradouro/numero/bairro/cep, telefone1, correio_eletronico, porte_empresa,
+              capital_social, data_inicio_atividade, opcao_simples, opcao_mei
+        Retorna erro se nenhum filtro for informado.
     """
+    p = params
+    if not _tem_algum_filtro_estabelecimentos(p):
+        return {
+            "erro": "Informe pelo menos um filtro (ex: razao_social, nome_fantasia, municipio_codigo, "
+            "cnae_codigo, porte_empresa, capital_social_min/max, data_inicio_de/ate, opcao_simples, opcao_mei)."
+        }
+
+    where_sql, args, extra_join_sql = _montar_where_estabelecimentos(p)
+    from_sql = _FROM_ESTABELECIMENTOS + " " + extra_join_sql
     count_sql = f"SELECT COUNT(*) AS total {from_sql} WHERE {where_sql}"
+    order_sql = ORDENAR_POR_SQL[p.ordenar_por]
     sql = f"""
         SELECT es.cnpj, em.razao_social, es.nome_fantasia,
                m.descricao AS municipio_nome, c.descricao AS atividade_principal_descricao,
-               es.situacao_cadastral, es.logradouro, es.numero, es.bairro, es.cep,
+               es.situacao_cadastral, es.data_situacao_cadastral,
+               mo.descricao AS motivo_situacao_descricao,
+               es.identificador_matriz_filial, es.logradouro, es.numero, es.bairro, es.cep,
                es.telefone1, es.correio_eletronico, es.situacao_especial,
                em.porte_empresa, em.capital_social, es.data_inicio_atividade,
                si.opcao_simples, si.opcao_mei
         {from_sql}
         WHERE {where_sql}
-        ORDER BY em.razao_social
+        ORDER BY {order_sql}
         LIMIT ? OFFSET ?
     """
     # Sequencial (nao asyncio.gather): a conexao com o banco e compartilhada e nao
     # e segura para uso concorrente por duas threads ao mesmo tempo.
-    #
-    # A contagem exata (total_encontrado) so e calculada quando NAO ha busca de
-    # texto livre (razao_social/nome_fantasia/bairro): esses campos nao tem indice
-    # utilizavel para LIKE '%...%', entao a mesma varredura lenta rodaria duas vezes
-    # (uma para contar, outra para os resultados) — dobrando o tempo de resposta de
-    # uma busca que ja e a mais lenta que existe aqui. Com filtros indexados
-    # (municipio/cnae/situacao/porte/etc.) a contagem e barata e vale a pena.
-    total = None
-    if not (p.razao_social or p.nome_fantasia or p.bairro):
-        count_rows = await _query(count_sql, tuple(args))
-        total = count_rows[0]["total"] if count_rows else None
+    count_rows = await _query(count_sql, tuple(args))
+    total = count_rows[0]["total"] if count_rows else None
     rows = await _query(sql, tuple(args) + (p.limit, p.offset))
     for r in rows:
         r["situacao_cadastral_descricao"] = _situacao_label(r.get("situacao_cadastral"))
+        r["matriz_filial_descricao"] = MATRIZ_FILIAL_MAP.get(r.get("identificador_matriz_filial"))
 
     return {
         "total_encontrado": total,
-        "total_encontrado_obs": None if total is not None else (
-            "nao calculado para nao dobrar o tempo de uma busca textual ampla (razao_social/"
-            "nome_fantasia/bairro); combine com municipio_codigo, cnae_codigo ou outro filtro "
-            "indexado se precisar do total exato"
-        ),
         "total_retornado": len(rows),
         "offset": p.offset,
         "limit": p.limit,
@@ -494,6 +643,20 @@ class BuscarSociosInput(BaseModel):
     nome: Optional[str] = Field(default=None, description="Trecho do nome do socio a buscar (busca parcial).", max_length=200)
     cnpj_cpf: Optional[str] = Field(
         default=None, description="CPF (com os 3 primeiros/2 ultimos digitos ocultos, como consta na base publica) ou CNPJ do socio, com ou sem formatacao.", max_length=20
+    )
+    identificador_socio: Optional[str] = Field(
+        default=None, description="Tipo do socio: '1' PESSOA JURIDICA, '2' PESSOA FISICA, '3' ESTRANGEIRO."
+    )
+    qualificacao_socio_codigo: Optional[str] = Field(
+        default=None,
+        description="Codigo da qualificacao do socio (ex: so 'Socio-Administrador'). Obtenha com "
+        "cnpj_referencia_buscar tabela='qualificacao_socio'.",
+        max_length=10,
+    )
+    faixa_etaria: Optional[str] = Field(
+        default=None,
+        description="Faixa etaria do socio pessoa fisica: '1' 0-12, '2' 13-20, '3' 21-30, '4' 31-40, '5' 41-50, "
+        "'6' 51-60, '7' 61-70, '8' 71-80, '9' maior que 80, '0' nao se aplica.",
     )
     limit: int = Field(default=20, ge=1, le=100)
     offset: int = Field(default=0, ge=0)
@@ -524,63 +687,76 @@ async def cnpj_buscar_socios(params: BuscarSociosInput) -> Dict[str, Any]:
     fisica vem parcialmente ocultos na base publica da Receita Federal
     (ex: '***123456**').
 
-    A busca por nome ignora maiusculas/minusculas mas NAO ignora acentos.
+    A busca por nome usa indice de busca completa (FTS5): ignora acentos e
+    maiusculas/minusculas, aceita varias palavras (todas precisam aparecer, em
+    qualquer ordem) e cada palavra e tratada como prefixo.
 
     Args:
-        params (BuscarSociosInput): nome (busca parcial) e/ou cnpj_cpf, mais paginacao.
+        params (BuscarSociosInput): nome (busca parcial) e/ou cnpj_cpf e/ou filtros
+            de tipo de socio (identificador_socio, qualificacao_socio_codigo,
+            faixa_etaria), mais paginacao.
 
     Returns:
-        dict com 'total_encontrado' (int | None — None quando a busca e por nome;
-        ver 'total_encontrado_obs'), 'total_retornado' (pagina atual), 'offset',
-        'limit' e 'resultados': lista de socios encontrados, cada um com
-        nome_socio, cnpj_cpf_socio, qualificacao_descricao,
+        dict com 'total_encontrado' (int), 'total_retornado' (pagina atual),
+        'offset', 'limit' e 'resultados': lista de socios encontrados, cada um com
+        nome_socio, cnpj_cpf_socio, qualificacao_descricao, identificador_socio,
+        identificador_socio_descricao, faixa_etaria, faixa_etaria_descricao,
         data_entrada_sociedade e a empresa vinculada (cnpj_basico, razao_social).
-        Retorna erro se nem nome nem cnpj_cpf forem informados.
+        Retorna erro se nenhum filtro for informado.
     """
     p = params
-    if not p.nome and not p.cnpj_cpf:
-        return {"erro": "Informe 'nome' ou 'cnpj_cpf' para buscar."}
+    if not any([p.nome, p.cnpj_cpf, p.identificador_socio, p.qualificacao_socio_codigo, p.faixa_etaria]):
+        return {"erro": "Informe pelo menos um filtro: 'nome', 'cnpj_cpf', 'identificador_socio', 'qualificacao_socio_codigo' ou 'faixa_etaria'."}
 
     where = []
     args: list = []
+    extra_join = ""
     if p.nome:
-        # LIKE simples (nao insensivel a acento) pelo mesmo motivo de performance
-        # de cnpj_buscar_estabelecimentos: socios tem ~658 mil linhas.
-        where.append("s.nome_socio LIKE ? COLLATE NOCASE")
-        args.append(f"%{p.nome}%")
+        fts_q = _fts_match_query(p.nome)
+        if fts_q:
+            extra_join = "JOIN fts_socios fts_s ON fts_s.rowid = s.rowid"
+            where.append("fts_s.nome_socio MATCH ?")
+            args.append(fts_q)
+        else:
+            where.append("0")
     if p.cnpj_cpf:
         where.append("s.cnpj_cpf_socio LIKE ?")
         args.append(f"%{_only_digits(p.cnpj_cpf) or p.cnpj_cpf}%")
+    if p.identificador_socio:
+        where.append("s.identificador_socio = ?")
+        args.append(p.identificador_socio)
+    if p.qualificacao_socio_codigo:
+        where.append("s.qualificacao_socio = ?")
+        args.append(p.qualificacao_socio_codigo)
+    if p.faixa_etaria:
+        where.append("s.faixa_etaria = ?")
+        args.append(p.faixa_etaria)
 
     where_sql = " AND ".join(where)
-    from_sql = """
+    from_sql = f"""
         FROM socios s
         LEFT JOIN qualificacao_socio q ON q.codigo = s.qualificacao_socio
         JOIN empresas em ON em.cnpj_basico = s.cnpj_basico
+        {extra_join}
     """
     count_sql = f"SELECT COUNT(*) AS total {from_sql} WHERE {where_sql}"
     sql = f"""
         SELECT s.nome_socio, s.cnpj_cpf_socio, s.data_entrada_sociedade,
-               q.descricao AS qualificacao_descricao,
+               q.descricao AS qualificacao_descricao, s.identificador_socio, s.faixa_etaria,
                s.cnpj_basico, em.razao_social
         {from_sql}
         WHERE {where_sql}
         ORDER BY s.nome_socio
         LIMIT ? OFFSET ?
     """
-    # total_encontrado so e calculado quando a busca e por cnpj_cpf (barata); busca
-    # por nome e LIKE sem indice em ~658 mil linhas, contar dobraria o tempo de resposta.
-    total = None
-    if not p.nome:
-        count_rows = await _query(count_sql, tuple(args))
-        total = count_rows[0]["total"] if count_rows else None
+    count_rows = await _query(count_sql, tuple(args))
+    total = count_rows[0]["total"] if count_rows else None
     rows = await _query(sql, tuple(args) + (p.limit, p.offset))
+    for r in rows:
+        r["identificador_socio_descricao"] = IDENTIFICADOR_SOCIO_MAP.get(r.get("identificador_socio"))
+        r["faixa_etaria_descricao"] = FAIXA_ETARIA_MAP.get(r.get("faixa_etaria"))
     return {
         "total_encontrado": total,
-        "total_encontrado_obs": None if total is not None else (
-            "nao calculado para nao dobrar o tempo de uma busca por nome (sem indice); "
-            "combine com cnpj_cpf se precisar do total exato"
-        ),
         "total_retornado": len(rows),
         "offset": p.offset,
         "limit": p.limit,
@@ -653,17 +829,29 @@ class EstatisticasInput(BaseModel):
     agrupar_por: str = Field(
         ..., description="Como agrupar a contagem: 'municipio', 'cnae', 'natureza_juridica' ou 'situacao_cadastral'."
     )
+    agrupar_por_2: Optional[str] = Field(
+        default=None,
+        description="Segunda dimensao para CRUZAR com agrupar_por (ex: municipio + cnae ao mesmo tempo, pra "
+        "responder 'quais CNAEs mais aparecem em cada municipio'). Mesmas opcoes de agrupar_por; deve ser "
+        "diferente dela. Cuidado: o numero de combinacoes possiveis cresce rapido, 'top' limita quantas voltam.",
+    )
     municipio_codigo: Optional[str] = Field(default=None, description="Filtra por municipio antes de agrupar (nao use junto com agrupar_por='municipio').")
     cnae_codigo: Optional[str] = Field(default=None, description="Filtra por CNAE antes de agrupar (nao use junto com agrupar_por='cnae').")
     situacao_cadastral: Optional[str] = Field(default=None, description="Filtra pela situacao cadastral ('01'..'08') antes de agrupar.")
-    top: int = Field(default=15, description="Quantas categorias retornar, ordenadas pela contagem (maior primeiro).", ge=1, le=100)
+    top: int = Field(default=15, description="Quantas categorias (ou combinacoes, se agrupar_por_2 for usado) retornar, ordenadas pela contagem (maior primeiro).", ge=1, le=100)
 
-    @field_validator("agrupar_por")
+    @field_validator("agrupar_por", "agrupar_por_2")
     @classmethod
-    def validate_group(cls, v: str) -> str:
-        if v not in GROUP_BY_COLUMNS:
-            raise ValueError(f"agrupar_por deve ser uma de: {', '.join(GROUP_BY_COLUMNS)}")
+    def validate_group(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in GROUP_BY_COLUMNS:
+            raise ValueError(f"agrupar_por/agrupar_por_2 deve ser uma de: {', '.join(GROUP_BY_COLUMNS)}")
         return v
+
+    @model_validator(mode="after")
+    def _valida_dimensoes_diferentes(self):
+        if self.agrupar_por_2 is not None and self.agrupar_por_2 == self.agrupar_por:
+            raise ValueError("agrupar_por_2 deve ser diferente de agrupar_por.")
+        return self
 
 
 @mcp.tool(
@@ -682,18 +870,25 @@ async def cnpj_estatisticas(params: EstatisticasInput) -> Dict[str, Any]:
     perguntas de visao geral, como 'quantas empresas ativas existem em Fortaleza'
     ou 'quais os municipios com mais padarias'.
 
+    Com agrupar_por_2, cruza DUAS dimensoes de uma vez (ex: municipio + cnae, pra
+    'quais CNAEs mais aparecem em cada municipio' numa unica chamada).
+
     Args:
-        params (EstatisticasInput): agrupar_por (obrigatorio) e filtros opcionais
+        params (EstatisticasInput): agrupar_por (obrigatorio), agrupar_por_2
+            (opcional, para cruzar duas dimensoes) e filtros opcionais
             (municipio_codigo, cnae_codigo, situacao_cadastral), mais 'top' para
-            limitar quantas categorias retornar.
+            limitar quantas categorias/combinacoes retornar.
 
     Returns:
-        dict com 'agrupado_por' e 'resultados': lista de
-        {"codigo": str, "descricao": str | None, "quantidade": int},
+        dict com 'agrupado_por', 'agrupado_por_2' (se usado) e 'resultados':
+        lista de {"codigo", "descricao", "codigo_2"?, "descricao_2"?, "quantidade"},
         ordenada por quantidade decrescente.
     """
     p = params
     group_col, desc_col, join_clause = GROUP_BY_COLUMNS[p.agrupar_por]
+    group_col2 = desc_col2 = join_clause2 = None
+    if p.agrupar_por_2:
+        group_col2, desc_col2, join_clause2 = GROUP_BY_COLUMNS[p.agrupar_por_2]
 
     where = []
     args: list = []
@@ -709,19 +904,30 @@ async def cnpj_estatisticas(params: EstatisticasInput) -> Dict[str, Any]:
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
 
     join_sql = ""
-    select_desc = "NULL AS descricao"
-    if p.agrupar_por == "natureza_juridica":
+    if "natureza_juridica" in (p.agrupar_por, p.agrupar_por_2):
         join_sql = "JOIN empresas em ON em.cnpj_basico = es.cnpj_basico"
+
+    select_desc = "NULL AS descricao"
     if join_clause:
         join_sql += f" LEFT JOIN {join_clause}"
         select_desc = f"{desc_col} AS descricao"
 
+    group_by_sql = group_col
+    select_extra = ""
+    if group_col2:
+        select_desc2 = "NULL AS descricao_2"
+        if join_clause2:
+            join_sql += f" LEFT JOIN {join_clause2}"
+            select_desc2 = f"{desc_col2} AS descricao_2"
+        select_extra = f", {group_col2} AS codigo_2, {select_desc2}"
+        group_by_sql = f"{group_col}, {group_col2}"
+
     sql = f"""
-        SELECT {group_col} AS codigo, {select_desc}, COUNT(*) AS quantidade
+        SELECT {group_col} AS codigo, {select_desc}{select_extra}, COUNT(*) AS quantidade
         FROM estabelecimentos es
         {join_sql}
         {where_sql}
-        GROUP BY {group_col}
+        GROUP BY {group_by_sql}
         ORDER BY quantidade DESC
         LIMIT ?
     """
@@ -730,7 +936,100 @@ async def cnpj_estatisticas(params: EstatisticasInput) -> Dict[str, Any]:
     if p.agrupar_por == "situacao_cadastral":
         for r in rows:
             r["descricao"] = _situacao_label(r.get("codigo"))
-    return {"agrupado_por": p.agrupar_por, "resultados": rows}
+    if p.agrupar_por_2 == "situacao_cadastral":
+        for r in rows:
+            r["descricao_2"] = _situacao_label(r.get("codigo_2"))
+
+    result = {"agrupado_por": p.agrupar_por, "resultados": rows}
+    if p.agrupar_por_2:
+        result["agrupado_por_2"] = p.agrupar_por_2
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tool 6: exportar estabelecimentos filtrados para CSV
+# ---------------------------------------------------------------------------
+
+class ExportarCsvInput(BuscarEstabelecimentosInput):
+    limit: int = Field(default=500, description="Numero maximo de linhas a exportar (1-2000).", ge=1, le=2000)
+
+
+@mcp.tool(
+    name="cnpj_exportar_csv",
+    annotations={
+        "title": "Exportar estabelecimentos filtrados para CSV",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def cnpj_exportar_csv(params: ExportarCsvInput) -> Dict[str, Any]:
+    """Gera um CSV pronto (texto separado por virgula, com cabecalho) a partir dos
+    mesmos filtros de cnpj_buscar_estabelecimentos — util para pedir uma planilha
+    filtrada sem precisar paginar manualmente e montar o arquivo na conversa.
+    Aceita ate 2000 linhas por chamada; para bases maiores que isso, combine
+    varias chamadas aumentando 'offset' e concatene os CSVs (reaproveitando o
+    cabecalho so da primeira).
+
+    Args:
+        params (ExportarCsvInput): mesmos filtros de BuscarEstabelecimentosInput
+            (razao_social, municipio_codigo, cnae_codigo, porte_empresa,
+            capital_social_min/max, data_inicio_de/ate, opcao_simples, opcao_mei
+            etc.), com 'limit' ate 2000 em vez de 100.
+
+    Returns:
+        dict com 'total_encontrado' (int | None — mesma logica de
+        cnpj_buscar_estabelecimentos), 'linhas_exportadas' (int) e 'csv' (str):
+        o conteudo CSV pronto, com cabecalho na primeira linha.
+        Retorna erro se nenhum filtro for informado.
+    """
+    p = params
+    if not _tem_algum_filtro_estabelecimentos(p):
+        return {
+            "erro": "Informe pelo menos um filtro (ex: razao_social, nome_fantasia, municipio_codigo, "
+            "cnae_codigo, porte_empresa, capital_social_min/max, data_inicio_de/ate, opcao_simples, opcao_mei)."
+        }
+
+    where_sql, args, extra_join_sql = _montar_where_estabelecimentos(p)
+    from_sql = _FROM_ESTABELECIMENTOS + " " + extra_join_sql
+    order_sql = ORDENAR_POR_SQL[p.ordenar_por]
+    sql = f"""
+        SELECT es.cnpj, em.razao_social, es.nome_fantasia,
+               m.descricao AS municipio_nome, c.descricao AS atividade_principal_descricao,
+               es.situacao_cadastral, es.data_situacao_cadastral,
+               mo.descricao AS motivo_situacao_descricao,
+               es.identificador_matriz_filial, es.logradouro, es.numero, es.bairro, es.cep,
+               es.telefone1, es.correio_eletronico, es.situacao_especial,
+               em.porte_empresa, em.capital_social, es.data_inicio_atividade,
+               si.opcao_simples, si.opcao_mei
+        {from_sql}
+        WHERE {where_sql}
+        ORDER BY {order_sql}
+        LIMIT ? OFFSET ?
+    """
+    count_sql = f"SELECT COUNT(*) AS total {from_sql} WHERE {where_sql}"
+    count_rows = await _query(count_sql, tuple(args))
+    total = count_rows[0]["total"] if count_rows else None
+    rows = await _query(sql, tuple(args) + (p.limit, p.offset))
+    for r in rows:
+        r["situacao_cadastral_descricao"] = _situacao_label(r.get("situacao_cadastral"))
+        r["matriz_filial_descricao"] = MATRIZ_FILIAL_MAP.get(r.get("identificador_matriz_filial"))
+
+    import csv
+    import io
+
+    buf = io.StringIO()
+    if rows:
+        writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()), extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return {
+        "total_encontrado": total,
+        "linhas_exportadas": len(rows),
+        "csv": buf.getvalue(),
+    }
 
 
 # ---------------------------------------------------------------------------
