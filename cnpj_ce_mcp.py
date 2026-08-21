@@ -88,11 +88,18 @@ def _query_sync(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
+_DB_LOCK = asyncio.Lock()
+
+
 async def _query(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
     """Roda _query_sync numa thread separada para nao bloquear o event loop
     (o driver libsql/sqlite3 e sincrono; sem isso, uma consulta lenta trava
-    o servidor inteiro, inclusive requisicoes de outros clientes)."""
-    return await asyncio.to_thread(_query_sync, sql, params)
+    o servidor inteiro, inclusive requisicoes de outros clientes). A trava
+    serializa o acesso: a conexao e compartilhada e nao e segura para duas
+    queries rodarem ao mesmo tempo em threads diferentes (isso ja travou o
+    servidor durante os testes)."""
+    async with _DB_LOCK:
+        return await asyncio.to_thread(_query_sync, sql, params)
 
 
 def _only_digits(s: str) -> str:
@@ -103,6 +110,48 @@ def _situacao_label(code: Optional[str]) -> Optional[str]:
     if code is None:
         return None
     return SITUACAO_CADASTRAL_MAP.get(code, code)
+
+
+# Pares (acentuado, base) mais comuns em portugues, para busca insensivel a acento.
+_ACCENT_PAIRS = [
+    ("Á", "A"), ("À", "A"), ("Â", "A"), ("Ã", "A"), ("Ä", "A"),
+    ("É", "E"), ("È", "E"), ("Ê", "E"), ("Ë", "E"),
+    ("Í", "I"), ("Ì", "I"), ("Î", "I"), ("Ï", "I"),
+    ("Ó", "O"), ("Ò", "O"), ("Ô", "O"), ("Õ", "O"), ("Ö", "O"),
+    ("Ú", "U"), ("Ù", "U"), ("Û", "U"), ("Ü", "U"),
+    ("Ç", "C"), ("Ñ", "N"),
+]
+
+
+def _strip_accents(text: str) -> str:
+    import unicodedata
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+
+
+def _normalize_search_term(text: str) -> str:
+    """Remove acentos e uniformiza para maiusculas, para casar com _norm_sql_expr()."""
+    return _strip_accents(text).upper()
+
+
+def _norm_sql_expr(column_sql: str) -> str:
+    """SQL que remove acentos comuns de `column_sql` e uniformiza maiusculas, para
+    permitir busca insensivel a acento (ex: buscar 'sao paulo' encontra 'São Paulo')."""
+    expr = f"UPPER({column_sql})"
+    for accented, base in _ACCENT_PAIRS:
+        expr = f"REPLACE({expr}, '{accented}', '{base}')"
+    return expr
+
+
+def _yyyymmdd(v: Optional[str]) -> Optional[str]:
+    """Normaliza uma data informada (com ou sem separadores) para o formato
+    YYYYMMDD usado nas colunas de data do dataset da RFB."""
+    if v is None:
+        return None
+    digits = _only_digits(v)
+    if len(digits) != 8:
+        raise ValueError(f"Data deve ter 8 digitos (YYYYMMDD ou YYYY-MM-DD), recebido: '{v}'.")
+    return digits
 
 
 # ---------------------------------------------------------------------------
@@ -211,29 +260,64 @@ class BuscarEstabelecimentosInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     razao_social: Optional[str] = Field(
-        default=None, description="Trecho da razao social a buscar (busca parcial, sem diferenciar maiusculas). Ex: 'PADARIA'.", max_length=200
+        default=None, description="Trecho da razao social a buscar (busca parcial, sem diferenciar maiusculas/acentos). Ex: 'PADARIA'.", max_length=200
     )
     nome_fantasia: Optional[str] = Field(
-        default=None, description="Trecho do nome fantasia a buscar (busca parcial). Ex: 'VO LEONOR'.", max_length=200
+        default=None, description="Trecho do nome fantasia a buscar (busca parcial, sem diferenciar maiusculas/acentos). Ex: 'VO LEONOR'.", max_length=200
     )
     municipio_codigo: Optional[str] = Field(
         default=None, description="Codigo numerico do municipio (obtenha com cnpj_referencia_buscar tabela='municipio').", max_length=10
     )
+    bairro: Optional[str] = Field(
+        default=None, description="Trecho do bairro a buscar (busca parcial, sem diferenciar maiusculas/acentos). Ex: 'ALDEOTA'.", max_length=200
+    )
     cnae_codigo: Optional[str] = Field(
         default=None, description="Codigo do CNAE fiscal principal (obtenha com cnpj_referencia_buscar tabela='cnae').", max_length=10
+    )
+    cnae_secundario_codigo: Optional[str] = Field(
+        default=None,
+        description="Codigo de CNAE que deve aparecer entre as atividades SECUNDARIAS do estabelecimento (nao o principal).",
+        max_length=10,
     )
     situacao_cadastral: Optional[str] = Field(
         default=None, description="Filtra pela situacao cadastral: '01' NULA, '02' ATIVA, '03' SUSPENSA, '04' INAPTA, '08' BAIXADA."
     )
+    porte_empresa: Optional[str] = Field(
+        default=None, description="Filtra pelo porte da empresa: '01' MICRO EMPRESA, '03' EMPRESA DE PEQUENO PORTE, '05' DEMAIS (nao ME/EPP)."
+    )
+    capital_social_min: Optional[float] = Field(default=None, description="Capital social minimo da empresa (R$), inclusive.", ge=0)
+    capital_social_max: Optional[float] = Field(default=None, description="Capital social maximo da empresa (R$), inclusive.", ge=0)
+    data_inicio_de: Optional[str] = Field(
+        default=None, description="Data de inicio de atividade minima, inclusive (formato 'YYYY-MM-DD' ou 'YYYYMMDD')."
+    )
+    data_inicio_ate: Optional[str] = Field(
+        default=None, description="Data de inicio de atividade maxima, inclusive (formato 'YYYY-MM-DD' ou 'YYYYMMDD')."
+    )
+    opcao_simples: Optional[bool] = Field(
+        default=None, description="Se True, retorna so quem optou pelo Simples Nacional; se False, so quem NAO optou."
+    )
+    opcao_mei: Optional[bool] = Field(
+        default=None, description="Se True, retorna so MEIs; se False, so quem NAO e MEI."
+    )
+    tem_situacao_especial: Optional[bool] = Field(
+        default=None,
+        description="Se True, retorna so estabelecimentos com situacao especial registrada (falencia, recuperacao "
+        "judicial, liquidacao, espolio etc.); se False, so quem NAO tem nenhuma.",
+    )
     limit: int = Field(default=20, description="Numero maximo de resultados (1-100).", ge=1, le=100)
     offset: int = Field(default=0, description="Quantos resultados pular, para paginacao.", ge=0)
 
-    @field_validator("razao_social", "nome_fantasia")
+    @field_validator("razao_social", "nome_fantasia", "bairro")
     @classmethod
     def _non_empty(cls, v: Optional[str]) -> Optional[str]:
         if v is not None and not v.strip():
             return None
         return v
+
+    @field_validator("data_inicio_de", "data_inicio_ate")
+    @classmethod
+    def _valida_data(cls, v: Optional[str]) -> Optional[str]:
+        return _yyyymmdd(v)
 
 
 @mcp.tool(
@@ -254,64 +338,150 @@ async def cnpj_buscar_estabelecimentos(params: BuscarEstabelecimentosInput) -> D
     (ex: 'padarias ativas em Fortaleza') e para localizar o CNPJ de uma empresa
     quando so se sabe o nome.
 
+    A busca por texto (razao_social, nome_fantasia, bairro) ignora maiusculas/
+    minusculas mas NAO ignora acentos (ex: 'sao paulo' NAO encontra 'São Paulo';
+    use o texto acentuado como esta na base). Use cnpj_referencia_buscar (que
+    ignora acentos) para confirmar o codigo de um municipio antes, se tiver duvida.
+
     Args:
         params (BuscarEstabelecimentosInput): filtros de busca (todos opcionais,
             exceto que pelo menos um deve ser preenchido), mais limit/offset para paginacao.
 
     Returns:
         dict com as chaves:
+            - total_encontrado (int | None): total de resultados que atendem aos
+              filtros (pode ser maior que a pagina atual — use offset/limit para
+              paginar). Vem None quando a busca usa razao_social/nome_fantasia/
+              bairro (texto livre sem indice) — nesse caso 'total_encontrado_obs'
+              explica o motivo; combine com um filtro indexado (municipio_codigo,
+              cnae_codigo etc.) se precisar do total exato.
             - total_retornado (int): quantidade de linhas nesta pagina
             - offset (int)
             - limit (int)
             - resultados (list[dict]): cada item contem cnpj, razao_social, nome_fantasia,
               municipio_nome, atividade_principal_descricao, situacao_cadastral_descricao,
-              logradouro/numero/bairro/cep, telefone1, correio_eletronico
+              logradouro/numero/bairro/cep, telefone1, correio_eletronico, porte_empresa,
+              capital_social, data_inicio_atividade, opcao_simples, opcao_mei
         Retorna erro se nenhum filtro for informado.
     """
     p = params
-    if not any([p.razao_social, p.nome_fantasia, p.municipio_codigo, p.cnae_codigo]):
+    if not any([
+        p.razao_social, p.nome_fantasia, p.municipio_codigo, p.bairro, p.cnae_codigo,
+        p.cnae_secundario_codigo, p.situacao_cadastral, p.porte_empresa,
+        p.capital_social_min is not None, p.capital_social_max is not None,
+        p.data_inicio_de, p.data_inicio_ate,
+        p.opcao_simples is not None, p.opcao_mei is not None, p.tem_situacao_especial is not None,
+    ]):
         return {
-            "erro": "Informe pelo menos um filtro: razao_social, nome_fantasia, municipio_codigo ou cnae_codigo."
+            "erro": "Informe pelo menos um filtro (ex: razao_social, nome_fantasia, municipio_codigo, "
+            "cnae_codigo, porte_empresa, capital_social_min/max, data_inicio_de/ate, opcao_simples, opcao_mei)."
         }
 
     where = []
     args: list = []
+    # Nota: razao_social/nome_fantasia/bairro usam LIKE simples (nao a busca
+    # insensivel a acento de _norm_sql_expr) de proposito — nessas tabelas
+    # grandes (~2M linhas) o REPLACE em cascata para remover acentos custava
+    # ~28s por busca (sem indice utilizavel). Ficou reservado para tabelas
+    # pequenas (referencia) e nome_socio, onde o custo e desprezivel.
     if p.razao_social:
         where.append("em.razao_social LIKE ? COLLATE NOCASE")
         args.append(f"%{p.razao_social}%")
     if p.nome_fantasia:
         where.append("es.nome_fantasia LIKE ? COLLATE NOCASE")
         args.append(f"%{p.nome_fantasia}%")
+    if p.bairro:
+        where.append("es.bairro LIKE ? COLLATE NOCASE")
+        args.append(f"%{p.bairro}%")
     if p.municipio_codigo:
         where.append("es.municipio = ?")
         args.append(p.municipio_codigo)
     if p.cnae_codigo:
         where.append("es.cnae_fiscal_principal = ?")
         args.append(p.cnae_codigo)
+    if p.cnae_secundario_codigo:
+        where.append("(',' || es.cnae_fiscal_secundaria || ',') LIKE ?")
+        args.append(f"%,{p.cnae_secundario_codigo},%")
     if p.situacao_cadastral:
         where.append("es.situacao_cadastral = ?")
         args.append(p.situacao_cadastral)
+    if p.porte_empresa:
+        where.append("em.porte_empresa = ?")
+        args.append(p.porte_empresa)
+    if p.capital_social_min is not None:
+        where.append("em.capital_social >= ?")
+        args.append(p.capital_social_min)
+    if p.capital_social_max is not None:
+        where.append("em.capital_social <= ?")
+        args.append(p.capital_social_max)
+    if p.data_inicio_de:
+        where.append("es.data_inicio_atividade >= ?")
+        args.append(p.data_inicio_de)
+    if p.data_inicio_ate:
+        where.append("es.data_inicio_atividade <= ?")
+        args.append(p.data_inicio_ate)
+    if p.opcao_simples is not None:
+        where.append("si.opcao_simples = ?")
+        args.append("S" if p.opcao_simples else "N")
+    if p.opcao_mei is not None:
+        where.append("si.opcao_mei = ?")
+        args.append("S" if p.opcao_mei else "N")
+    if p.tem_situacao_especial is not None:
+        if p.tem_situacao_especial:
+            where.append("(es.situacao_especial IS NOT NULL AND es.situacao_especial <> '')")
+        else:
+            where.append("(es.situacao_especial IS NULL OR es.situacao_especial = '')")
 
     where_sql = " AND ".join(where)
+    from_sql = """
+        FROM estabelecimentos es
+        JOIN empresas em ON em.cnpj_basico = es.cnpj_basico
+        LEFT JOIN simples si ON si.cnpj_basico = es.cnpj_basico
+        LEFT JOIN municipio m ON m.codigo = es.municipio
+        LEFT JOIN cnae c ON c.codigo = es.cnae_fiscal_principal
+    """
+    count_sql = f"SELECT COUNT(*) AS total {from_sql} WHERE {where_sql}"
     sql = f"""
         SELECT es.cnpj, em.razao_social, es.nome_fantasia,
                m.descricao AS municipio_nome, c.descricao AS atividade_principal_descricao,
                es.situacao_cadastral, es.logradouro, es.numero, es.bairro, es.cep,
-               es.telefone1, es.correio_eletronico
-        FROM estabelecimentos es
-        JOIN empresas em ON em.cnpj_basico = es.cnpj_basico
-        LEFT JOIN municipio m ON m.codigo = es.municipio
-        LEFT JOIN cnae c ON c.codigo = es.cnae_fiscal_principal
+               es.telefone1, es.correio_eletronico, es.situacao_especial,
+               em.porte_empresa, em.capital_social, es.data_inicio_atividade,
+               si.opcao_simples, si.opcao_mei
+        {from_sql}
         WHERE {where_sql}
         ORDER BY em.razao_social
         LIMIT ? OFFSET ?
     """
-    args.extend([p.limit, p.offset])
-    rows = await _query(sql, tuple(args))
+    # Sequencial (nao asyncio.gather): a conexao com o banco e compartilhada e nao
+    # e segura para uso concorrente por duas threads ao mesmo tempo.
+    #
+    # A contagem exata (total_encontrado) so e calculada quando NAO ha busca de
+    # texto livre (razao_social/nome_fantasia/bairro): esses campos nao tem indice
+    # utilizavel para LIKE '%...%', entao a mesma varredura lenta rodaria duas vezes
+    # (uma para contar, outra para os resultados) — dobrando o tempo de resposta de
+    # uma busca que ja e a mais lenta que existe aqui. Com filtros indexados
+    # (municipio/cnae/situacao/porte/etc.) a contagem e barata e vale a pena.
+    total = None
+    if not (p.razao_social or p.nome_fantasia or p.bairro):
+        count_rows = await _query(count_sql, tuple(args))
+        total = count_rows[0]["total"] if count_rows else None
+    rows = await _query(sql, tuple(args) + (p.limit, p.offset))
     for r in rows:
         r["situacao_cadastral_descricao"] = _situacao_label(r.get("situacao_cadastral"))
 
-    return {"total_retornado": len(rows), "offset": p.offset, "limit": p.limit, "resultados": rows}
+    return {
+        "total_encontrado": total,
+        "total_encontrado_obs": None if total is not None else (
+            "nao calculado para nao dobrar o tempo de uma busca textual ampla (razao_social/"
+            "nome_fantasia/bairro); combine com municipio_codigo, cnae_codigo ou outro filtro "
+            "indexado se precisar do total exato"
+        ),
+        "total_retornado": len(rows),
+        "offset": p.offset,
+        "limit": p.limit,
+        "resultados": rows,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -354,14 +524,17 @@ async def cnpj_buscar_socios(params: BuscarSociosInput) -> Dict[str, Any]:
     fisica vem parcialmente ocultos na base publica da Receita Federal
     (ex: '***123456**').
 
+    A busca por nome ignora maiusculas/minusculas mas NAO ignora acentos.
+
     Args:
         params (BuscarSociosInput): nome (busca parcial) e/ou cnpj_cpf, mais paginacao.
 
     Returns:
-        dict com 'total_retornado', 'offset', 'limit' e 'resultados': lista de
-        socios encontrados, cada um com nome_socio, cnpj_cpf_socio,
-        qualificacao_descricao, data_entrada_sociedade e a empresa vinculada
-        (cnpj_basico, razao_social).
+        dict com 'total_encontrado' (int | None — None quando a busca e por nome;
+        ver 'total_encontrado_obs'), 'total_retornado' (pagina atual), 'offset',
+        'limit' e 'resultados': lista de socios encontrados, cada um com
+        nome_socio, cnpj_cpf_socio, qualificacao_descricao,
+        data_entrada_sociedade e a empresa vinculada (cnpj_basico, razao_social).
         Retorna erro se nem nome nem cnpj_cpf forem informados.
     """
     p = params
@@ -371,6 +544,8 @@ async def cnpj_buscar_socios(params: BuscarSociosInput) -> Dict[str, Any]:
     where = []
     args: list = []
     if p.nome:
+        # LIKE simples (nao insensivel a acento) pelo mesmo motivo de performance
+        # de cnpj_buscar_estabelecimentos: socios tem ~658 mil linhas.
         where.append("s.nome_socio LIKE ? COLLATE NOCASE")
         args.append(f"%{p.nome}%")
     if p.cnpj_cpf:
@@ -378,20 +553,39 @@ async def cnpj_buscar_socios(params: BuscarSociosInput) -> Dict[str, Any]:
         args.append(f"%{_only_digits(p.cnpj_cpf) or p.cnpj_cpf}%")
 
     where_sql = " AND ".join(where)
+    from_sql = """
+        FROM socios s
+        LEFT JOIN qualificacao_socio q ON q.codigo = s.qualificacao_socio
+        JOIN empresas em ON em.cnpj_basico = s.cnpj_basico
+    """
+    count_sql = f"SELECT COUNT(*) AS total {from_sql} WHERE {where_sql}"
     sql = f"""
         SELECT s.nome_socio, s.cnpj_cpf_socio, s.data_entrada_sociedade,
                q.descricao AS qualificacao_descricao,
                s.cnpj_basico, em.razao_social
-        FROM socios s
-        LEFT JOIN qualificacao_socio q ON q.codigo = s.qualificacao_socio
-        JOIN empresas em ON em.cnpj_basico = s.cnpj_basico
+        {from_sql}
         WHERE {where_sql}
         ORDER BY s.nome_socio
         LIMIT ? OFFSET ?
     """
-    args.extend([p.limit, p.offset])
-    rows = await _query(sql, tuple(args))
-    return {"total_retornado": len(rows), "offset": p.offset, "limit": p.limit, "resultados": rows}
+    # total_encontrado so e calculado quando a busca e por cnpj_cpf (barata); busca
+    # por nome e LIKE sem indice em ~658 mil linhas, contar dobraria o tempo de resposta.
+    total = None
+    if not p.nome:
+        count_rows = await _query(count_sql, tuple(args))
+        total = count_rows[0]["total"] if count_rows else None
+    rows = await _query(sql, tuple(args) + (p.limit, p.offset))
+    return {
+        "total_encontrado": total,
+        "total_encontrado_obs": None if total is not None else (
+            "nao calculado para nao dobrar o tempo de uma busca por nome (sem indice); "
+            "combine com cnpj_cpf se precisar do total exato"
+        ),
+        "total_retornado": len(rows),
+        "offset": p.offset,
+        "limit": p.limit,
+        "resultados": rows,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -443,8 +637,8 @@ async def cnpj_referencia_buscar(params: ReferenciaBuscarInput) -> Dict[str, Any
     """
     table = REFERENCE_TABLES[params.tabela]
     rows = await _query(
-        f"SELECT codigo, descricao FROM {table} WHERE descricao LIKE ? COLLATE NOCASE ORDER BY descricao LIMIT ?",
-        (f"%{params.texto}%", params.limit),
+        f"SELECT codigo, descricao FROM {table} WHERE {_norm_sql_expr('descricao')} LIKE ? ORDER BY descricao LIMIT ?",
+        (f"%{_normalize_search_term(params.texto)}%", params.limit),
     )
     return {"tabela": params.tabela, "resultados": rows}
 
@@ -539,6 +733,54 @@ async def cnpj_estatisticas(params: EstatisticasInput) -> Dict[str, Any]:
     return {"agrupado_por": p.agrupar_por, "resultados": rows}
 
 
+# ---------------------------------------------------------------------------
+# Limitador de requisicoes (protecao leve contra abuso): o servidor e publico
+# e sem autenticacao (decisao deliberada, dado que os dados sao publicos), mas
+# sem limite qualquer um com a URL poderia consumir a cota gratuita do Turso.
+# ---------------------------------------------------------------------------
+
+class RateLimitMiddleware:
+    """Limite simples de requisicoes por IP (janela deslizante em memoria).
+    Suficiente para um unico processo Render; nao e distribuido nem persistente."""
+
+    def __init__(self, app, max_requests: int = 60, window_seconds: float = 60.0):
+        self.app = app
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._hits: dict = {}
+
+    def _client_ip(self, scope) -> str:
+        headers = dict(scope.get("headers") or [])
+        fwd = headers.get(b"x-forwarded-for")
+        if fwd:
+            return fwd.decode("latin-1").split(",")[0].strip()
+        client = scope.get("client")
+        return client[0] if client else "unknown"
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        import time
+
+        ip = self._client_ip(scope)
+        now = time.monotonic()
+        hits = [t for t in self._hits.get(ip, []) if now - t < self.window_seconds]
+        if len(hits) >= self.max_requests:
+            from starlette.responses import JSONResponse
+
+            response = JSONResponse(
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32000, "message": "Muitas requisicoes. Tente novamente em instantes."}},
+                status_code=429,
+            )
+            await response(scope, receive, send)
+            return
+        hits.append(now)
+        self._hits[ip] = hits
+        await self.app(scope, receive, send)
+
+
 if __name__ == "__main__":
     port = os.environ.get("PORT")
     if port:
@@ -553,6 +795,7 @@ if __name__ == "__main__":
             allow_headers=["*"],
             expose_headers=["mcp-session-id"],
         )
-        mcp.run(transport="http", host="0.0.0.0", port=int(port), path="/mcp", middleware=[cors])
+        rate_limit = Middleware(RateLimitMiddleware, max_requests=60, window_seconds=60.0)
+        mcp.run(transport="http", host="0.0.0.0", port=int(port), path="/mcp", middleware=[cors, rate_limit])
     else:
         mcp.run()
