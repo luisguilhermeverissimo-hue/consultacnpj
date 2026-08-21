@@ -15,6 +15,7 @@ Tabelas disponiveis:
   simples           - opcao pelo Simples Nacional / MEI
   cnae, municipio, natureza_juridica, qualificacao_socio, pais, motivo - tabelas de referencia
 """
+import asyncio
 import os
 import sqlite3
 from typing import Optional, List, Dict, Any
@@ -79,12 +80,19 @@ def _get_conn():
     return _CONN
 
 
-def _query(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+def _query_sync(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
     """Executa um SELECT e retorna uma lista de dicts (nome_coluna -> valor)."""
     conn = _get_conn()
     cur = conn.execute(sql, params)
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+async def _query(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+    """Roda _query_sync numa thread separada para nao bloquear o event loop
+    (o driver libsql/sqlite3 e sincrono; sem isso, uma consulta lenta trava
+    o servidor inteiro, inclusive requisicoes de outros clientes)."""
+    return await asyncio.to_thread(_query_sync, sql, params)
 
 
 def _only_digits(s: str) -> str:
@@ -153,7 +161,7 @@ async def cnpj_consultar(params: ConsultarCnpjInput) -> Dict[str, Any]:
         nao existir, ou existir mas nao ter estabelecimento no Ceara.
     """
     cnpj = params.cnpj
-    rows = _query(
+    rows = await _query(
         """
         SELECT es.*, m.descricao AS municipio_nome, c.descricao AS atividade_principal_descricao
         FROM estabelecimentos es
@@ -170,10 +178,10 @@ async def cnpj_consultar(params: ConsultarCnpjInput) -> Dict[str, Any]:
     estab["situacao_cadastral_descricao"] = _situacao_label(estab.get("situacao_cadastral"))
     cnpj_basico = estab["cnpj_basico"]
 
-    empresa_rows = _query("SELECT * FROM empresas WHERE cnpj_basico = ?", (cnpj_basico,))
+    empresa_rows = await _query("SELECT * FROM empresas WHERE cnpj_basico = ?", (cnpj_basico,))
     empresa = empresa_rows[0] if empresa_rows else None
 
-    socios = _query(
+    socios = await _query(
         """
         SELECT s.*, q.descricao AS qualificacao_descricao
         FROM socios s
@@ -183,7 +191,7 @@ async def cnpj_consultar(params: ConsultarCnpjInput) -> Dict[str, Any]:
         (cnpj_basico,),
     )
 
-    simples_rows = _query("SELECT * FROM simples WHERE cnpj_basico = ?", (cnpj_basico,))
+    simples_rows = await _query("SELECT * FROM simples WHERE cnpj_basico = ?", (cnpj_basico,))
     simples = simples_rows[0] if simples_rows else None
 
     return {
@@ -299,7 +307,7 @@ async def cnpj_buscar_estabelecimentos(params: BuscarEstabelecimentosInput) -> D
         LIMIT ? OFFSET ?
     """
     args.extend([p.limit, p.offset])
-    rows = _query(sql, tuple(args))
+    rows = await _query(sql, tuple(args))
     for r in rows:
         r["situacao_cadastral_descricao"] = _situacao_label(r.get("situacao_cadastral"))
 
@@ -382,7 +390,7 @@ async def cnpj_buscar_socios(params: BuscarSociosInput) -> Dict[str, Any]:
         LIMIT ? OFFSET ?
     """
     args.extend([p.limit, p.offset])
-    rows = _query(sql, tuple(args))
+    rows = await _query(sql, tuple(args))
     return {"total_retornado": len(rows), "offset": p.offset, "limit": p.limit, "resultados": rows}
 
 
@@ -434,7 +442,7 @@ async def cnpj_referencia_buscar(params: ReferenciaBuscarInput) -> Dict[str, Any
         dict com 'tabela' e 'resultados': lista de {"codigo": str, "descricao": str}.
     """
     table = REFERENCE_TABLES[params.tabela]
-    rows = _query(
+    rows = await _query(
         f"SELECT codigo, descricao FROM {table} WHERE descricao LIKE ? COLLATE NOCASE ORDER BY descricao LIMIT ?",
         (f"%{params.texto}%", params.limit),
     )
@@ -524,7 +532,7 @@ async def cnpj_estatisticas(params: EstatisticasInput) -> Dict[str, Any]:
         LIMIT ?
     """
     args.append(p.top)
-    rows = _query(sql, tuple(args))
+    rows = await _query(sql, tuple(args))
     if p.agrupar_por == "situacao_cadastral":
         for r in rows:
             r["descricao"] = _situacao_label(r.get("codigo"))
