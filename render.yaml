@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: cnpj-ce-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python cnpj_ce_mcp.py
+    envVars:
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
