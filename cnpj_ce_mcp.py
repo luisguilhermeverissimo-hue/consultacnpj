@@ -152,37 +152,6 @@ def _situacao_label(code: Optional[str]) -> Optional[str]:
     return SITUACAO_CADASTRAL_MAP.get(code, code)
 
 
-# Pares (acentuado, base) mais comuns em portugues, para busca insensivel a acento.
-_ACCENT_PAIRS = [
-    ("Á", "A"), ("À", "A"), ("Â", "A"), ("Ã", "A"), ("Ä", "A"),
-    ("É", "E"), ("È", "E"), ("Ê", "E"), ("Ë", "E"),
-    ("Í", "I"), ("Ì", "I"), ("Î", "I"), ("Ï", "I"),
-    ("Ó", "O"), ("Ò", "O"), ("Ô", "O"), ("Õ", "O"), ("Ö", "O"),
-    ("Ú", "U"), ("Ù", "U"), ("Û", "U"), ("Ü", "U"),
-    ("Ç", "C"), ("Ñ", "N"),
-]
-
-
-def _strip_accents(text: str) -> str:
-    import unicodedata
-    nfkd = unicodedata.normalize("NFKD", text)
-    return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
-
-
-def _normalize_search_term(text: str) -> str:
-    """Remove acentos e uniformiza para maiusculas, para casar com _norm_sql_expr()."""
-    return _strip_accents(text).upper()
-
-
-def _norm_sql_expr(column_sql: str) -> str:
-    """SQL que remove acentos comuns de `column_sql` e uniformiza maiusculas, para
-    permitir busca insensivel a acento (ex: buscar 'sao paulo' encontra 'São Paulo')."""
-    expr = f"UPPER({column_sql})"
-    for accented, base in _ACCENT_PAIRS:
-        expr = f"REPLACE({expr}, '{accented}', '{base}')"
-    return expr
-
-
 def _split_codes(v: Optional[str]) -> List[str]:
     """Separa uma lista de codigos por virgula (ex: '1389,1373') em uma lista limpa."""
     if not v:
@@ -817,9 +786,20 @@ async def cnpj_referencia_buscar(params: ReferenciaBuscarInput) -> Dict[str, Any
         dict com 'tabela' e 'resultados': lista de {"codigo": str, "descricao": str}.
     """
     table = REFERENCE_TABLES[params.tabela]
+    fts_table = f"fts_{table}"
+    fts_q = _fts_match_query(params.texto)
+    if not fts_q:
+        return {"tabela": params.tabela, "resultados": []}
     rows = await _query(
-        f"SELECT codigo, descricao FROM {table} WHERE {_norm_sql_expr('descricao')} LIKE ? ORDER BY descricao LIMIT ?",
-        (f"%{_normalize_search_term(params.texto)}%", params.limit),
+        f"""
+        SELECT t.codigo, t.descricao
+        FROM {table} t
+        JOIN {fts_table} fts ON fts.rowid = t.rowid
+        WHERE fts.descricao MATCH ?
+        ORDER BY t.descricao
+        LIMIT ?
+        """,
+        (fts_q, params.limit),
     )
     return {"tabela": params.tabela, "resultados": rows}
 
